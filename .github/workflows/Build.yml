@@ -65,42 +65,42 @@ jobs:
           }
 
           python3 - "${profile}" "${ACK_BRANCH}" >> "${GITHUB_OUTPUT}" <<'PY'
-import json
-import sys
+          import json
+          import sys
 
-path = sys.argv[1]
-selected = sys.argv[2]
+          path = sys.argv[1]
+          selected = sys.argv[2]
 
-with open(path, "r", encoding="utf-8") as f:
-    p = json.load(f)
+          with open(path, "r", encoding="utf-8") as f:
+              p = json.load(f)
 
-if p.get("branch") != selected:
-    raise SystemExit(f"profile branch mismatch: {p.get('branch')} != {selected}")
+          if p.get("branch") != selected:
+              raise SystemExit(f"profile branch mismatch: {p.get('branch')} != {selected}")
 
-if p.get("enabled", True) is False:
-    raise SystemExit(f"profile disabled: {selected}")
+          if p.get("enabled", True) is False:
+              raise SystemExit(f"profile disabled: {selected}")
 
-if p.get("backend") != "google_build_sh":
-    raise SystemExit(f"unsupported backend: {p.get('backend')}")
+          if p.get("backend") != "google_build_sh":
+              raise SystemExit(f"unsupported backend: {p.get('backend')}")
 
-clang = p.get("clang", "")
-if not isinstance(clang, str) or not clang.startswith("clang-r"):
-    raise SystemExit(f"invalid clang: {clang!r}")
+          clang = p.get("clang", "")
+          if not isinstance(clang, str) or not clang.startswith("clang-r"):
+              raise SystemExit(f"invalid clang: {clang!r}")
 
-fields = {
-    "profile_branch": p.get("branch", ""),
-    "kernel_version": p.get("kernel_version", ""),
-    "android_release": p.get("android_release", ""),
-    "backend": p.get("backend", ""),
-    "clang": clang,
-    "kernel_build_path": p.get("kernel_build_path", ""),
-    "kernel_build_ref": p.get("kernel_build_ref", ""),
-    "lto": p.get("lto", ""),
-}
+          fields = {
+              "profile_branch": p.get("branch", ""),
+              "kernel_version": p.get("kernel_version", ""),
+              "android_release": p.get("android_release", ""),
+              "backend": p.get("backend", ""),
+              "clang": clang,
+              "kernel_build_path": p.get("kernel_build_path", ""),
+              "kernel_build_ref": p.get("kernel_build_ref", ""),
+              "lto": p.get("lto", ""),
+          }
 
-for k, v in fields.items():
-    print(f"{k}={'' if v is None else v}")
-PY
+          for k, v in fields.items():
+              print(f"{k}={'' if v is None else v}")
+          PY
 
       - name: Checkout selected ACK cache
         shell: bash
