@@ -28,8 +28,17 @@ jobs:
   build:
     name: ${{ inputs.ack_branch }}
     runs-on: ubuntu-latest
+    timeout-minutes: 180
 
     steps:
+      - name: Disable IPv6
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
+          sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
+          sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=1
+
       - name: Checkout workflow repo
         uses: actions/checkout@v4
         with:
@@ -55,7 +64,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          for tool in bash git gh python3 tar zstd make gcc g++ bc bison flex rsync; do
+          for tool in bash git gh python3 sha256sum tar zstd make gcc g++ bc bison flex rsync; do
             command -v "$tool" >/dev/null || {
               echo "Missing required host tool: $tool" >&2
               exit 1
@@ -100,9 +109,16 @@ jobs:
               "android_release": profile.get("android_release", ""),
               "backend": profile.get("backend", ""),
               "clang": profile.get("clang", ""),
-              "image": profile.get("image", ""),
+              "kernel_build_path": profile.get("kernel_build_path", ""),
+              "kernel_build_ref": profile.get("kernel_build_ref", ""),
+              "kleaf_workspace_path": profile.get("kleaf_workspace_path", ""),
+              "kernel_manifest_branch": profile.get("kernel_manifest_branch", ""),
               "lto": profile.get("lto", ""),
           }
+
+          backend = fields["backend"]
+          if backend not in {"google_build_sh", "kleaf"}:
+              raise SystemExit(f"Unsupported backend in profile: {backend!r}")
 
           clang = fields["clang"]
           if not isinstance(clang, str) or not clang.startswith("clang-r"):
@@ -123,16 +139,7 @@ jobs:
           fetch-depth: 1
           submodules: false
 
-      - name: Restore Clang cache
-        id: clang-cache
-        uses: actions/cache@v4
-        with:
-          path: toolchains/${{ steps.profile.outputs.clang }}
-          key: aosp-${{ runner.os }}-${{ steps.profile.outputs.clang }}
-
       - name: Download Clang
-        if: steps.clang-cache.outputs.cache-hit != 'true'
-        id: clang-download
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -140,6 +147,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          rm -rf toolchains
           mkdir -p toolchains
 
           pattern="${CLANG}-linux-x86-*.tar.zst"
@@ -155,9 +163,10 @@ jobs:
             exit 1
           }
 
-          sha256sum "${archive}" | tee clang-archive.sha256
+          sha256sum "${archive}" > clang-archive.sha256
 
           tar --zstd -xf "${archive}" -C toolchains
+          rm -f "${archive}"
 
           test -x "toolchains/${CLANG}/bin/clang"
 
@@ -183,7 +192,7 @@ jobs:
             echo "sha256=${sha256}"
           } >> "${GITHUB_OUTPUT}"
 
-          "${CLANG_DIR}/bin/clang" --version
+          echo "Using $("${CLANG_DIR}/bin/clang" --version | head -n 1)"
 
       - name: Add 16GB swap
         shell: bash
@@ -199,9 +208,7 @@ jobs:
           sudo chmod 600 "${swapfile}"
           sudo mkswap "${swapfile}"
           sudo swapon "${swapfile}"
-
-          free -h
-          swapon --show
+          echo "Enabled 16G swap at ${swapfile}"
 
       - name: Run ACK build wrapper
         shell: bash
@@ -224,6 +231,10 @@ jobs:
           KERNEL_VERSION: ${{ steps.profile.outputs.kernel_version }}
           ANDROID_RELEASE: ${{ steps.profile.outputs.android_release }}
           BACKEND: ${{ steps.profile.outputs.backend }}
+          KERNEL_BUILD_PATH: ${{ steps.profile.outputs.kernel_build_path }}
+          KERNEL_BUILD_REF: ${{ steps.profile.outputs.kernel_build_ref }}
+          KLEAF_WORKSPACE_PATH: ${{ steps.profile.outputs.kleaf_workspace_path }}
+          KERNEL_MANIFEST_BRANCH: ${{ steps.profile.outputs.kernel_manifest_branch }}
           CLANG: ${{ steps.profile.outputs.clang }}
           CLANG_ARCHIVE_SHA256: ${{ steps.clang.outputs.sha256 }}
           LTO: ${{ steps.profile.outputs.lto }}
@@ -239,6 +250,10 @@ jobs:
             echo "kernel_version=${KERNEL_VERSION}"
             echo "android_release=${ANDROID_RELEASE}"
             echo "backend=${BACKEND}"
+            echo "kernel_build_path=${KERNEL_BUILD_PATH}"
+            echo "kernel_build_ref=${KERNEL_BUILD_REF}"
+            echo "kleaf_workspace_path=${KLEAF_WORKSPACE_PATH}"
+            echo "kernel_manifest_branch=${KERNEL_MANIFEST_BRANCH}"
             echo "kernel_source_commit=${kernel_source_commit}"
             echo "clang=${CLANG}"
             echo "clang_archive_sha256=${CLANG_ARCHIVE_SHA256}"
@@ -257,7 +272,6 @@ jobs:
 
           test -d "${work_root}" || {
             echo "Expected ACK worktree missing: ${work_root}" >&2
-            find ack-control -maxdepth 4 -type d -print | sort >&2
             exit 1
           }
 
@@ -286,12 +300,56 @@ jobs:
           image_count="$(find dist/images -type f | wc -l)"
           if [ "${image_count}" -eq 0 ]; then
             echo "No kernel image artifact found under ${work_root}" >&2
-            find "${work_root}" -type f | sort >&2
             exit 1
           fi
 
-          echo "Staged artifacts:"
-          find dist -type f -print | sort
+          echo "Staged $(find dist -type f | wc -l) artifact files for ${ACK_BRANCH}."
+
+      - name: Print failure diagnostics
+        if: failure()
+        shell: bash
+        env:
+          ACK_BRANCH: ${{ inputs.ack_branch }}
+        run: |
+          set -euo pipefail
+
+          work_root="ack-control/.work/${ACK_BRANCH}"
+
+          echo "Failure diagnostics for ${ACK_BRANCH}:"
+          if [ -f build-info.txt ]; then
+            cat build-info.txt
+          fi
+
+          if [ -d "${work_root}" ]; then
+            echo
+            echo "Relevant files under ${work_root}:"
+            find "${work_root}" -maxdepth 2 -type f \( \
+              -name '*.log' -o \
+              -name 'Image' -o \
+              -name 'Image.gz' -o \
+              -name 'Image.lz4' -o \
+              -name '.config' -o \
+              -name 'System.map' -o \
+              -name 'vmlinux' -o \
+              -name 'MODULE.bazel' -o \
+              -name 'WORKSPACE' -o \
+              -name 'WORKSPACE.bazel' -o \
+              -name 'WORKSPACE.bzlmod' -o \
+              -name '.bazelrc' -o \
+              -name 'bazel' -o \
+              -name 'bazel.sh' -o \
+              -name '_setup_env.sh' \
+            \) -printf '%P\n' | sort
+
+            for log in "${work_root}"/logs/*.log; do
+              [ -f "${log}" ] || continue
+              echo
+              echo "Last 40 lines of ${log##${work_root}/}:"
+              tail -n 40 "${log}"
+            done
+          else
+            echo "Missing worktree: ${work_root}" >&2
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
