@@ -1,0 +1,193 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ack_branch:
+        description: ACK profile branch
+        type: choice
+        required: true
+        default: android12-5.10-lts
+        options:
+          - android12-5.10-lts
+          - android13-5.10-lts
+          - android13-5.15-lts
+          - android14-5.15-lts
+          - android14-6.1-lts
+          - android15-6.6-lts
+          - android16-6.12-lts
+
+jobs:
+  build:
+    name: Compile
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Checkout ACK profile repo
+        uses: actions/checkout@v4
+        with:
+          repository: CoreShiftD/android_kernel_common_lts
+          ref: main
+          path: ack-control
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            flex \
+            gh \
+            jq \
+            libelf-dev \
+            libssl-dev \
+            lld \
+            llvm \
+            rsync \
+            zstd
+
+      - name: Read profile
+        id: profile
+        env:
+          ACK_BRANCH: ${{ inputs.ack_branch }}
+        run: |
+          set -euo pipefail
+
+          profile="ack-control/configs/profiles/${ACK_BRANCH}.json"
+          test -f "${profile}"
+
+          profile_branch="$(jq -r '.branch' "${profile}")"
+          if [ "${profile_branch}" != "${ACK_BRANCH}" ]; then
+            echo "Profile branch ${profile_branch} does not match selected branch ${ACK_BRANCH}" >&2
+            exit 1
+          fi
+
+          kernel_version="$(jq -r '.kernel_version' "${profile}")"
+          android_release="$(jq -r '.android_release' "${profile}")"
+          backend="$(jq -r '.backend' "${profile}")"
+          clang="$(jq -r '.clang' "${profile}")"
+          image="$(jq -r '.image' "${profile}")"
+          lto="$(jq -r '.lto // empty' "${profile}")"
+
+          {
+            echo "profile_branch=${profile_branch}"
+            echo "kernel_version=${kernel_version}"
+            echo "android_release=${android_release}"
+            echo "backend=${backend}"
+            echo "clang=${clang}"
+            echo "image=${image}"
+            echo "lto=${lto}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: CoreShiftD/android_kernel_common_lts
+          ref: ${{ steps.profile.outputs.profile_branch }}
+          path: kernel/common
+
+      - name: Download Clang
+        id: clang
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLANG: ${{ steps.profile.outputs.clang }}
+        run: |
+          set -euo pipefail
+
+          pattern="${CLANG}-linux-x86-*.tar.zst"
+          gh release download aosp-clang-toolchains \
+            --repo CoreShiftD/android_kernel_common_lts \
+            --pattern "${pattern}" \
+            --dir .
+
+          archive="$(find . -maxdepth 1 -type f -name "${pattern}" -print -quit)"
+          test -n "${archive}"
+          sha256="$(sha256sum "${archive}" | awk '{print $1}')"
+
+          mkdir -p "toolchains/${CLANG}"
+          tar --use-compress-program=unzstd -xf "${archive}" -C "toolchains/${CLANG}" --strip-components=1
+          test -x "toolchains/${CLANG}/bin/clang"
+
+          {
+            echo "archive=${archive#./}"
+            echo "sha256=${sha256}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Run ACK build wrapper
+        env:
+          ACK_BRANCH: ${{ inputs.ack_branch }}
+          CLANG: ${{ steps.profile.outputs.clang }}
+        run: |
+          set -euo pipefail
+
+          ack-control/build.sh "${ACK_BRANCH}" "${GITHUB_WORKSPACE}/kernel/common" "${GITHUB_WORKSPACE}/toolchains/${CLANG}"
+
+      - name: Write build info
+        env:
+          ACK_BRANCH: ${{ inputs.ack_branch }}
+          PROFILE_BRANCH: ${{ steps.profile.outputs.profile_branch }}
+          KERNEL_VERSION: ${{ steps.profile.outputs.kernel_version }}
+          ANDROID_RELEASE: ${{ steps.profile.outputs.android_release }}
+          BACKEND: ${{ steps.profile.outputs.backend }}
+          CLANG: ${{ steps.profile.outputs.clang }}
+          CLANG_ARCHIVE_SHA256: ${{ steps.clang.outputs.sha256 }}
+          LTO: ${{ steps.profile.outputs.lto }}
+        run: |
+          set -euo pipefail
+
+          kernel_source_commit="$(git -C kernel/common rev-parse HEAD)"
+          date_utc="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          {
+            echo "ack_branch=${ACK_BRANCH}"
+            echo "profile_branch=${PROFILE_BRANCH}"
+            echo "kernel_version=${KERNEL_VERSION}"
+            echo "android_release=${ANDROID_RELEASE}"
+            echo "backend=${BACKEND}"
+            echo "kernel_source_commit=${kernel_source_commit}"
+            echo "clang=${CLANG}"
+            echo "clang_archive_sha256=${CLANG_ARCHIVE_SHA256}"
+            echo "lto=${LTO}"
+            echo "date_utc=${date_utc}"
+          } > build-info.txt
+
+      - name: Stage artifact files
+        run: |
+          set -euo pipefail
+
+          rm -rf dist
+          mkdir -p dist
+
+          install -D -m 0644 build-info.txt dist/build-info.txt
+
+          for dir in kernel/common/dist kernel/common/out/dist; do
+            if [ -d "${dir}" ]; then
+              mkdir -p "dist/${dir}"
+              rsync -a "${dir}/" "dist/${dir}/"
+            fi
+          done
+
+          find kernel/common -type f \( \
+            -name 'Image' -o \
+            -name 'Image.*' -o \
+            -name '.config' -o \
+            -name 'System.map' -o \
+            -name 'vmlinux' -o \
+            -name '*.config' -o \
+            -name '*.log' \
+          \) -print0 | while IFS= read -r -d '' file; do
+            install -D -m 0644 "${file}" "dist/${file}"
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coreshift-gki-${{ inputs.ack_branch }}
+          path: dist/
+          if-no-files-found: error

@@ -1,0 +1,7 @@
+out/
+dist/
+.work/
+kernel/
+toolchains/
+*.tar.zst
+*.log
