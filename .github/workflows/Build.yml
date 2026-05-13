@@ -18,7 +18,7 @@ jobs:
 
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 4
       matrix:
         ack_branch:
           - android11-5.4-lts
@@ -44,11 +44,11 @@ jobs:
           ref: main
           path: ack-control
           fetch-depth: 1
+          sparse-checkout-cone-mode: false
           sparse-checkout: |
-            build.sh
-            scripts
-            configs
-          sparse-checkout-cone-mode: true
+            /build.sh
+            /scripts/**
+            /configs/**
 
       - name: Read ACK profile
         id: profile
@@ -59,44 +59,48 @@ jobs:
           set -euo pipefail
 
           profile="ack-control/configs/profiles/${ACK_BRANCH}.json"
-
-          python3 - "${profile}" "${ACK_BRANCH}" >> "${GITHUB_OUTPUT}" <<'PY'
-          import json
-          import sys
-
-          path = sys.argv[1]
-          selected = sys.argv[2]
-
-          with open(path, "r", encoding="utf-8") as f:
-              p = json.load(f)
-
-          if p.get("branch") != selected:
-              raise SystemExit("profile branch mismatch")
-
-          if p.get("enabled", True) is False:
-              raise SystemExit(f"profile disabled: {selected}")
-
-          if p.get("backend") != "google_build_sh":
-              raise SystemExit(f"unsupported backend: {p.get('backend')}")
-
-          clang = p.get("clang", "")
-          if not isinstance(clang, str) or not clang.startswith("clang-r"):
-              raise SystemExit(f"invalid clang: {clang!r}")
-
-          fields = {
-              "profile_branch": p.get("branch", ""),
-              "kernel_version": p.get("kernel_version", ""),
-              "android_release": p.get("android_release", ""),
-              "backend": p.get("backend", ""),
-              "clang": clang,
-              "kernel_build_path": p.get("kernel_build_path", ""),
-              "kernel_build_ref": p.get("kernel_build_ref", ""),
-              "lto": p.get("lto", ""),
+          test -f "${profile}" || {
+            echo "Missing profile: ${profile}" >&2
+            exit 1
           }
 
-          for k, v in fields.items():
-              print(f"{k}={'' if v is None else v}")
-          PY
+          python3 - "${profile}" "${ACK_BRANCH}" >> "${GITHUB_OUTPUT}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+selected = sys.argv[2]
+
+with open(path, "r", encoding="utf-8") as f:
+    p = json.load(f)
+
+if p.get("branch") != selected:
+    raise SystemExit(f"profile branch mismatch: {p.get('branch')} != {selected}")
+
+if p.get("enabled", True) is False:
+    raise SystemExit(f"profile disabled: {selected}")
+
+if p.get("backend") != "google_build_sh":
+    raise SystemExit(f"unsupported backend: {p.get('backend')}")
+
+clang = p.get("clang", "")
+if not isinstance(clang, str) or not clang.startswith("clang-r"):
+    raise SystemExit(f"invalid clang: {clang!r}")
+
+fields = {
+    "profile_branch": p.get("branch", ""),
+    "kernel_version": p.get("kernel_version", ""),
+    "android_release": p.get("android_release", ""),
+    "backend": p.get("backend", ""),
+    "clang": clang,
+    "kernel_build_path": p.get("kernel_build_path", ""),
+    "kernel_build_ref": p.get("kernel_build_ref", ""),
+    "lto": p.get("lto", ""),
+}
+
+for k, v in fields.items():
+    print(f"{k}={'' if v is None else v}")
+PY
 
       - name: Checkout selected ACK cache
         shell: bash
@@ -105,20 +109,27 @@ jobs:
         run: |
           set -euo pipefail
 
-          git -C ack-control sparse-checkout set \
-            build.sh \
-            scripts \
-            configs \
-            "${KERNEL_BUILD_PATH}" \
-            external/prebuilts/build-tools
+          test -n "${KERNEL_BUILD_PATH}" || {
+            echo "Profile did not provide kernel_build_path" >&2
+            exit 1
+          }
+
+          git -C ack-control sparse-checkout set --no-cone \
+            /build.sh \
+            /scripts/** \
+            /configs/** \
+            "/${KERNEL_BUILD_PATH}/**" \
+            /external/prebuilts/build-tools/**
 
           test -d "ack-control/${KERNEL_BUILD_PATH}" || {
-            echo "Missing ${KERNEL_BUILD_PATH}. Run setup-cache.yml first." >&2
+            echo "Missing ack-control/${KERNEL_BUILD_PATH}" >&2
+            echo "Run setup-cache.yml in CoreShiftD/android_kernel_common_lts first." >&2
             exit 1
           }
 
           test -d "ack-control/external/prebuilts/build-tools" || {
-            echo "Missing external/prebuilts/build-tools. Run setup-cache.yml first." >&2
+            echo "Missing ack-control/external/prebuilts/build-tools" >&2
+            echo "Run setup-cache.yml in CoreShiftD/android_kernel_common_lts first." >&2
             exit 1
           }
 
@@ -170,7 +181,6 @@ jobs:
             --dir toolchains
 
           archive="$(find toolchains -maxdepth 1 -type f -name "${pattern}" -print -quit)"
-
           test -n "${archive}" || {
             echo "Missing Clang archive: ${pattern}" >&2
             exit 1
@@ -256,7 +266,10 @@ jobs:
           set -euo pipefail
 
           work_root="ack-control/.work/${ACK_BRANCH}"
-          test -d "${work_root}"
+          test -d "${work_root}" || {
+            echo "Missing work root: ${work_root}" >&2
+            exit 1
+          }
 
           rm -rf dist
           mkdir -p dist/images dist/config dist/debug dist/logs dist/metadata
