@@ -7,11 +7,9 @@ on:
         description: ACK branch set
         type: choice
         required: true
-        default: all
+        default: legacy
         options:
-          - all
           - legacy
-          - kleaf
 
 permissions:
   contents: read
@@ -45,30 +43,14 @@ jobs:
           set -euo pipefail
 
           case "${TARGET}" in
-            all)
-              branches=(
-                android12-5.10-lts
-                android13-5.10-lts
-                android13-5.15-lts
-                android14-5.15-lts
-                android14-6.1-lts
-                android15-6.6-lts
-                android16-6.12-lts
-              )
-              ;;
             legacy)
               branches=(
+                android11-5.4-lts
+                android12-5.4-lts
                 android12-5.10-lts
                 android13-5.10-lts
                 android13-5.15-lts
                 android14-5.15-lts
-              )
-              ;;
-            kleaf)
-              branches=(
-                android14-6.1-lts
-                android15-6.6-lts
-                android16-6.12-lts
               )
               ;;
             *)
@@ -119,7 +101,6 @@ jobs:
             scripts
             configs
             external/kernel-build
-            external/kleaf-workspace
             external/prebuilts/build-tools
           sparse-checkout-cone-mode: true
 
