@@ -43,10 +43,10 @@ jobs:
           path: ack-control
           fetch-depth: 1
           sparse-checkout: |
-            build.sh
-            scripts
-            configs
             external/kernel-build
+            configs
+            scripts
+            build.sh
           sparse-checkout-cone-mode: true
 
       - name: Check host tools
