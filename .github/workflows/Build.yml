@@ -44,6 +44,7 @@ jobs:
           fetch-depth: 1
           sparse-checkout: |
             external/kernel-build
+            external/kleaf-workspace
             configs
             scripts
             build.sh
