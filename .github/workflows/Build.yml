@@ -1,35 +1,98 @@
-name: Build
+name: Build All
 
 on:
   workflow_dispatch:
     inputs:
-      ack_branch:
-        description: ACK profile branch
+      target:
+        description: ACK branch set
         type: choice
         required: true
-        default: android12-5.10-lts
+        default: all
         options:
-          - android12-5.10-lts
-          - android13-5.10-lts
-          - android13-5.15-lts
-          - android14-5.15-lts
-          - android14-6.1-lts
-          - android15-6.6-lts
-          - android16-6.12-lts
+          - all
+          - legacy
+          - kleaf
 
 permissions:
   contents: read
 
 concurrency:
-  group: build-${{ inputs.ack_branch }}
+  group: build-${{ inputs.target }}
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: ${{ inputs.ack_branch }}
+  resolve_matrix:
+    name: Resolve target matrix
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+    steps:
+      - name: Disable IPv6
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
+          sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
+          sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=1
 
+      - name: Resolve matrix
+        id: resolve
+        shell: bash
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+
+          case "${TARGET}" in
+            all)
+              branches=(
+                android12-5.10-lts
+                android13-5.10-lts
+                android13-5.15-lts
+                android14-5.15-lts
+                android14-6.1-lts
+                android15-6.6-lts
+                android16-6.12-lts
+              )
+              ;;
+            legacy)
+              branches=(
+                android12-5.10-lts
+                android13-5.10-lts
+                android13-5.15-lts
+                android14-5.15-lts
+              )
+              ;;
+            kleaf)
+              branches=(
+                android14-6.1-lts
+                android15-6.6-lts
+                android16-6.12-lts
+              )
+              ;;
+            *)
+              echo "Unsupported target: ${TARGET}" >&2
+              exit 1
+              ;;
+          esac
+
+          python3 - "${branches[@]}" >> "${GITHUB_OUTPUT}" <<'PY'
+          import json
+          import sys
+
+          print(f"matrix={json.dumps([{'ack_branch': branch} for branch in sys.argv[1:]], separators=(',', ':'))}")
+          PY
+
+  build:
+    name: ${{ matrix.ack_branch }}
+    runs-on: ubuntu-latest
+    needs: resolve_matrix
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve_matrix.outputs.matrix) }}
     steps:
       - name: Disable IPv6
         shell: bash
@@ -52,11 +115,12 @@ jobs:
           path: ack-control
           fetch-depth: 1
           sparse-checkout: |
+            build.sh
+            scripts
+            configs
             external/kernel-build
             external/kleaf-workspace
-            configs
-            scripts
-            build.sh
+            external/prebuilts/build-tools
           sparse-checkout-cone-mode: true
 
       - name: Check host tools
@@ -71,13 +135,11 @@ jobs:
             }
           done
 
-          echo "Host tools OK"
-
       - name: Read ACK profile
         id: profile
         shell: bash
         env:
-          ACK_BRANCH: ${{ inputs.ack_branch }}
+          ACK_BRANCH: ${{ matrix.ack_branch }}
         run: |
           set -euo pipefail
 
@@ -164,7 +226,6 @@ jobs:
           }
 
           sha256sum "${archive}" > clang-archive.sha256
-
           tar --zstd -xf "${archive}" -C toolchains
           rm -f "${archive}"
 
@@ -181,11 +242,7 @@ jobs:
           CLANG_DIR="${GITHUB_WORKSPACE}/toolchains/${CLANG}"
           test -x "${CLANG_DIR}/bin/clang"
 
-          if [ -f clang-archive.sha256 ]; then
-            sha256="$(awk '{print $1}' clang-archive.sha256)"
-          else
-            sha256="cache-hit"
-          fi
+          sha256="$(awk '{print $1}' clang-archive.sha256)"
 
           {
             echo "dir=${CLANG_DIR}"
@@ -213,7 +270,7 @@ jobs:
       - name: Run ACK build wrapper
         shell: bash
         env:
-          ACK_BRANCH: ${{ inputs.ack_branch }}
+          ACK_BRANCH: ${{ matrix.ack_branch }}
           CLANG_DIR: ${{ steps.clang.outputs.dir }}
         run: |
           set -euo pipefail
@@ -226,7 +283,7 @@ jobs:
       - name: Write build info
         shell: bash
         env:
-          ACK_BRANCH: ${{ inputs.ack_branch }}
+          ACK_BRANCH: ${{ matrix.ack_branch }}
           PROFILE_BRANCH: ${{ steps.profile.outputs.profile_branch }}
           KERNEL_VERSION: ${{ steps.profile.outputs.kernel_version }}
           ANDROID_RELEASE: ${{ steps.profile.outputs.android_release }}
@@ -264,7 +321,7 @@ jobs:
       - name: Stage artifacts
         shell: bash
         env:
-          ACK_BRANCH: ${{ inputs.ack_branch }}
+          ACK_BRANCH: ${{ matrix.ack_branch }}
         run: |
           set -euo pipefail
 
@@ -309,7 +366,7 @@ jobs:
         if: failure()
         shell: bash
         env:
-          ACK_BRANCH: ${{ inputs.ack_branch }}
+          ACK_BRANCH: ${{ matrix.ack_branch }}
         run: |
           set -euo pipefail
 
@@ -354,6 +411,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: coreshift-gki-${{ inputs.ack_branch }}
+          name: coreshift-gki-${{ matrix.ack_branch }}
           path: dist/
           if-no-files-found: error
