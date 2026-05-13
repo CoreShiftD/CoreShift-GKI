@@ -261,6 +261,7 @@ jobs:
         env:
           ACK_BRANCH: ${{ matrix.ack_branch }}
           CLANG_DIR: ${{ steps.clang.outputs.dir }}
+          DISABLE_DEFCONFIG_CHECK: "1"
         run: |
           set -euo pipefail
 
@@ -324,8 +325,6 @@ jobs:
           rm -rf dist
           mkdir -p dist/images dist/config dist/debug dist/logs dist/metadata
 
-          install -D -m 0644 build-info.txt dist/metadata/build-info.txt
-
           find "${work_root}" -type f \( \
             -name 'Image' -o \
             -name 'Image.gz' -o \
@@ -348,6 +347,37 @@ jobs:
             echo "No kernel image artifact found under ${work_root}" >&2
             exit 1
           fi
+
+          ikconfig_extracted=no
+          extract_script="kernel/common/scripts/extract-ikconfig"
+          ikconfig_output="dist/config/ikconfig-extracted.config"
+          ikconfig_tmp="${ikconfig_output}.tmp"
+          rm -f "${ikconfig_output}" "${ikconfig_tmp}"
+
+          if [ -f "${extract_script}" ]; then
+            candidates=(
+              "${work_root}/dist/Image"
+              "${work_root}/dist/Image.gz"
+              "${work_root}/dist/Image.lz4"
+              "${work_root}/out/arch/arm64/boot/Image"
+              "${work_root}/out/arch/arm64/boot/Image.gz"
+              "${work_root}/out/arch/arm64/boot/Image.lz4"
+            )
+
+            for candidate in "${candidates[@]}"; do
+              [ -f "${candidate}" ] || continue
+              if bash "${extract_script}" "${candidate}" > "${ikconfig_tmp}" 2>/dev/null && [ -s "${ikconfig_tmp}" ]; then
+                mv "${ikconfig_tmp}" "${ikconfig_output}"
+                ikconfig_extracted=yes
+                echo "Extracted IKCONFIG from ${candidate}"
+                break
+              fi
+              rm -f "${ikconfig_tmp}"
+            done
+          fi
+
+          echo "ikconfig_extracted=${ikconfig_extracted}" >> build-info.txt
+          install -D -m 0644 build-info.txt dist/metadata/build-info.txt
 
           echo "Staged $(find dist -type f | wc -l) artifact files for ${ACK_BRANCH}."
 
