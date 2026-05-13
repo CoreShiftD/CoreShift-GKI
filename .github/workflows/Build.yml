@@ -17,73 +17,101 @@ on:
           - android15-6.6-lts
           - android16-6.12-lts
 
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ inputs.ack_branch }}
+  cancel-in-progress: false
+
 jobs:
   build:
-    name: Compile
+    name: ${{ inputs.ack_branch }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
 
     steps:
       - name: Checkout workflow repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Checkout ACK profile repo
+      - name: Checkout ACK control repo
         uses: actions/checkout@v4
         with:
           repository: CoreShiftD/android_kernel_common_lts
           ref: main
           path: ack-control
+          fetch-depth: 1
+          sparse-checkout: |
+            build.sh
+            scripts
+            configs
+            external/kernel-build
+          sparse-checkout-cone-mode: true
 
-      - name: Install dependencies
+      - name: Check host tools
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            bc \
-            bison \
-            build-essential \
-            flex \
-            gh \
-            jq \
-            libelf-dev \
-            libssl-dev \
-            lld \
-            llvm \
-            rsync \
-            zstd
+          set -euo pipefail
 
-      - name: Read profile
+          for tool in bash git gh python3 tar zstd make gcc g++ bc bison flex rsync; do
+            command -v "$tool" >/dev/null || {
+              echo "Missing required host tool: $tool" >&2
+              exit 1
+            }
+          done
+
+          echo "Host tools OK"
+
+      - name: Read ACK profile
         id: profile
+        shell: bash
         env:
           ACK_BRANCH: ${{ inputs.ack_branch }}
         run: |
           set -euo pipefail
 
           profile="ack-control/configs/profiles/${ACK_BRANCH}.json"
-          test -f "${profile}"
-
-          profile_branch="$(jq -r '.branch' "${profile}")"
-          if [ "${profile_branch}" != "${ACK_BRANCH}" ]; then
-            echo "Profile branch ${profile_branch} does not match selected branch ${ACK_BRANCH}" >&2
+          test -f "${profile}" || {
+            echo "Missing profile: ${profile}" >&2
             exit 1
-          fi
+          }
 
-          kernel_version="$(jq -r '.kernel_version' "${profile}")"
-          android_release="$(jq -r '.android_release' "${profile}")"
-          backend="$(jq -r '.backend' "${profile}")"
-          clang="$(jq -r '.clang' "${profile}")"
-          image="$(jq -r '.image' "${profile}")"
-          lto="$(jq -r '.lto // empty' "${profile}")"
+          python3 - "${profile}" "${ACK_BRANCH}" >> "${GITHUB_OUTPUT}" <<'PY'
+          import json
+          import sys
 
-          {
-            echo "profile_branch=${profile_branch}"
-            echo "kernel_version=${kernel_version}"
-            echo "android_release=${android_release}"
-            echo "backend=${backend}"
-            echo "clang=${clang}"
-            echo "image=${image}"
-            echo "lto=${lto}"
-          } >> "${GITHUB_OUTPUT}"
+          profile_path = sys.argv[1]
+          selected_branch = sys.argv[2]
+
+          with open(profile_path, "r", encoding="utf-8") as f:
+              profile = json.load(f)
+
+          profile_branch = profile.get("branch")
+          if profile_branch != selected_branch:
+              raise SystemExit(
+                  f"Profile branch {profile_branch!r} does not match selected branch {selected_branch!r}"
+              )
+
+          fields = {
+              "profile_branch": profile_branch,
+              "kernel_version": profile.get("kernel_version", ""),
+              "android_release": profile.get("android_release", ""),
+              "backend": profile.get("backend", ""),
+              "clang": profile.get("clang", ""),
+              "image": profile.get("image", ""),
+              "lto": profile.get("lto", ""),
+          }
+
+          clang = fields["clang"]
+          if not isinstance(clang, str) or not clang.startswith("clang-r"):
+              raise SystemExit(f"Invalid clang in profile: {clang!r}")
+
+          for key, value in fields.items():
+              if value is None:
+                  value = ""
+              print(f"{key}={value}")
+          PY
 
       - name: Checkout kernel source
         uses: actions/checkout@v4
@@ -91,44 +119,104 @@ jobs:
           repository: CoreShiftD/android_kernel_common_lts
           ref: ${{ steps.profile.outputs.profile_branch }}
           path: kernel/common
+          fetch-depth: 1
+          submodules: false
+
+      - name: Restore Clang cache
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: toolchains/${{ steps.profile.outputs.clang }}
+          key: aosp-${{ runner.os }}-${{ steps.profile.outputs.clang }}
 
       - name: Download Clang
-        id: clang
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        id: clang-download
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           CLANG: ${{ steps.profile.outputs.clang }}
         run: |
           set -euo pipefail
 
+          mkdir -p toolchains
+
           pattern="${CLANG}-linux-x86-*.tar.zst"
+
           gh release download aosp-clang-toolchains \
             --repo CoreShiftD/android_kernel_common_lts \
             --pattern "${pattern}" \
-            --dir .
+            --dir toolchains
 
-          archive="$(find . -maxdepth 1 -type f -name "${pattern}" -print -quit)"
-          test -n "${archive}"
-          sha256="$(sha256sum "${archive}" | awk '{print $1}')"
+          archive="$(find toolchains -maxdepth 1 -type f -name "${pattern}" -print -quit)"
+          test -n "${archive}" || {
+            echo "Could not find downloaded archive matching ${pattern}" >&2
+            exit 1
+          }
 
-          mkdir -p "toolchains/${CLANG}"
-          tar --use-compress-program=unzstd -xf "${archive}" -C "toolchains/${CLANG}" --strip-components=1
+          sha256sum "${archive}" | tee clang-archive.sha256
+
+          tar --zstd -xf "${archive}" -C toolchains
+
           test -x "toolchains/${CLANG}/bin/clang"
 
-          {
-            echo "archive=${archive#./}"
-            echo "sha256=${sha256}"
-          } >> "${GITHUB_OUTPUT}"
-
-      - name: Run ACK build wrapper
+      - name: Verify Clang
+        id: clang
+        shell: bash
         env:
-          ACK_BRANCH: ${{ inputs.ack_branch }}
           CLANG: ${{ steps.profile.outputs.clang }}
         run: |
           set -euo pipefail
 
-          ack-control/build.sh "${ACK_BRANCH}" "${GITHUB_WORKSPACE}/kernel/common" "${GITHUB_WORKSPACE}/toolchains/${CLANG}"
+          CLANG_DIR="${GITHUB_WORKSPACE}/toolchains/${CLANG}"
+          test -x "${CLANG_DIR}/bin/clang"
+
+          if [ -f clang-archive.sha256 ]; then
+            sha256="$(awk '{print $1}' clang-archive.sha256)"
+          else
+            sha256="cache-hit"
+          fi
+
+          {
+            echo "dir=${CLANG_DIR}"
+            echo "sha256=${sha256}"
+          } >> "${GITHUB_OUTPUT}"
+
+          "${CLANG_DIR}/bin/clang" --version
+
+      - name: Add 16GB swap
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          swapfile="/mnt/swapfile"
+
+          sudo swapoff "${swapfile}" 2>/dev/null || true
+          sudo rm -f "${swapfile}"
+
+          sudo fallocate -l 16G "${swapfile}" || sudo dd if=/dev/zero of="${swapfile}" bs=1M count=16384 status=progress
+          sudo chmod 600 "${swapfile}"
+          sudo mkswap "${swapfile}"
+          sudo swapon "${swapfile}"
+
+          free -h
+          swapon --show
+
+      - name: Run ACK build wrapper
+        shell: bash
+        env:
+          ACK_BRANCH: ${{ inputs.ack_branch }}
+          CLANG_DIR: ${{ steps.clang.outputs.dir }}
+        run: |
+          set -euo pipefail
+
+          ack-control/build.sh \
+            "${ACK_BRANCH}" \
+            "${GITHUB_WORKSPACE}/kernel/common" \
+            "${CLANG_DIR}"
 
       - name: Write build info
+        shell: bash
         env:
           ACK_BRANCH: ${{ inputs.ack_branch }}
           PROFILE_BRANCH: ${{ steps.profile.outputs.profile_branch }}
@@ -157,33 +245,52 @@ jobs:
             echo "date_utc=${date_utc}"
           } > build-info.txt
 
-      - name: Stage artifact files
+      - name: Stage artifacts
+        shell: bash
+        env:
+          ACK_BRANCH: ${{ inputs.ack_branch }}
         run: |
           set -euo pipefail
 
+          work_root="ack-control/.work/${ACK_BRANCH}"
+
+          test -d "${work_root}" || {
+            echo "Expected ACK worktree missing: ${work_root}" >&2
+            find ack-control -maxdepth 4 -type d -print | sort >&2
+            exit 1
+          }
+
           rm -rf dist
-          mkdir -p dist
+          mkdir -p dist/images dist/config dist/debug dist/logs dist/metadata
 
-          install -D -m 0644 build-info.txt dist/build-info.txt
+          install -D -m 0644 build-info.txt dist/metadata/build-info.txt
 
-          for dir in kernel/common/dist kernel/common/out/dist; do
-            if [ -d "${dir}" ]; then
-              mkdir -p "dist/${dir}"
-              rsync -a "${dir}/" "dist/${dir}/"
-            fi
-          done
-
-          find kernel/common -type f \( \
+          find "${work_root}" -type f \( \
             -name 'Image' -o \
-            -name 'Image.*' -o \
-            -name '.config' -o \
+            -name 'Image.gz' -o \
+            -name 'Image.lz4' \
+          \) -exec cp -a {} dist/images/ \;
+
+          find "${work_root}" -type f -name '.config' \
+            -exec cp -a {} dist/config/ \; || true
+
+          find "${work_root}" -type f \( \
             -name 'System.map' -o \
-            -name 'vmlinux' -o \
-            -name '*.config' -o \
-            -name '*.log' \
-          \) -print0 | while IFS= read -r -d '' file; do
-            install -D -m 0644 "${file}" "dist/${file}"
-          done
+            -name 'vmlinux' \
+          \) -exec cp -a {} dist/debug/ \; || true
+
+          find "${work_root}" -type f -name '*.log' \
+            -exec cp -a {} dist/logs/ \; || true
+
+          image_count="$(find dist/images -type f | wc -l)"
+          if [ "${image_count}" -eq 0 ]; then
+            echo "No kernel image artifact found under ${work_root}" >&2
+            find "${work_root}" -type f | sort >&2
+            exit 1
+          fi
+
+          echo "Staged artifacts:"
+          find dist -type f -print | sort
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
