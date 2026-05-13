@@ -1,80 +1,33 @@
-name: Build All
+name: Build
 
 on:
   workflow_dispatch:
-    inputs:
-      target:
-        description: ACK branch set
-        type: choice
-        required: true
-        default: legacy
-        options:
-          - legacy
 
 permissions:
   contents: read
 
 concurrency:
-  group: build-${{ inputs.target }}
+  group: build-legacy
   cancel-in-progress: false
 
 jobs:
-  resolve_matrix:
-    name: Resolve target matrix
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    outputs:
-      matrix: ${{ steps.resolve.outputs.matrix }}
-    steps:
-      - name: Disable IPv6
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
-          sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
-          sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=1
-
-      - name: Resolve matrix
-        id: resolve
-        shell: bash
-        env:
-          TARGET: ${{ inputs.target }}
-        run: |
-          set -euo pipefail
-
-          case "${TARGET}" in
-            legacy)
-              branches=(
-                android11-5.4-lts
-                android12-5.4-lts
-                android12-5.10-lts
-                android13-5.10-lts
-                android13-5.15-lts
-                android14-5.15-lts
-              )
-              ;;
-            *)
-              echo "Unsupported target: ${TARGET}" >&2
-              exit 1
-              ;;
-          esac
-
-          python3 - "${branches[@]}" >> "${GITHUB_OUTPUT}" <<'PY'
-          import json
-          import sys
-
-          print(f"matrix={json.dumps([{'ack_branch': branch} for branch in sys.argv[1:]], separators=(',', ':'))}")
-          PY
-
   build:
     name: ${{ matrix.ack_branch }}
     runs-on: ubuntu-latest
-    needs: resolve_matrix
     timeout-minutes: 180
+
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
-        include: ${{ fromJSON(needs.resolve_matrix.outputs.matrix) }}
+        ack_branch:
+          - android11-5.4-lts
+          - android12-5.4-lts
+          - android12-5.10-lts
+          - android13-5.10-lts
+          - android13-5.15-lts
+          - android14-5.15-lts
+
     steps:
       - name: Disable IPv6
         shell: bash
@@ -84,12 +37,7 @@ jobs:
           sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
           sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=1
 
-      - name: Checkout workflow repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Checkout ACK control repo
+      - name: Checkout ACK control files
         uses: actions/checkout@v4
         with:
           repository: CoreShiftD/android_kernel_common_lts
@@ -100,21 +48,7 @@ jobs:
             build.sh
             scripts
             configs
-            external/kernel-build
-            external/prebuilts/build-tools
           sparse-checkout-cone-mode: true
-
-      - name: Check host tools
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          for tool in bash git gh python3 sha256sum tar zstd make gcc g++ bc bison flex rsync; do
-            command -v "$tool" >/dev/null || {
-              echo "Missing required host tool: $tool" >&2
-              exit 1
-            }
-          done
 
       - name: Read ACK profile
         id: profile
@@ -125,53 +59,83 @@ jobs:
           set -euo pipefail
 
           profile="ack-control/configs/profiles/${ACK_BRANCH}.json"
-          test -f "${profile}" || {
-            echo "Missing profile: ${profile}" >&2
-            exit 1
-          }
 
           python3 - "${profile}" "${ACK_BRANCH}" >> "${GITHUB_OUTPUT}" <<'PY'
           import json
           import sys
 
-          profile_path = sys.argv[1]
-          selected_branch = sys.argv[2]
+          path = sys.argv[1]
+          selected = sys.argv[2]
 
-          with open(profile_path, "r", encoding="utf-8") as f:
-              profile = json.load(f)
+          with open(path, "r", encoding="utf-8") as f:
+              p = json.load(f)
 
-          profile_branch = profile.get("branch")
-          if profile_branch != selected_branch:
-              raise SystemExit(
-                  f"Profile branch {profile_branch!r} does not match selected branch {selected_branch!r}"
-              )
+          if p.get("branch") != selected:
+              raise SystemExit("profile branch mismatch")
+
+          if p.get("enabled", True) is False:
+              raise SystemExit(f"profile disabled: {selected}")
+
+          if p.get("backend") != "google_build_sh":
+              raise SystemExit(f"unsupported backend: {p.get('backend')}")
+
+          clang = p.get("clang", "")
+          if not isinstance(clang, str) or not clang.startswith("clang-r"):
+              raise SystemExit(f"invalid clang: {clang!r}")
 
           fields = {
-              "profile_branch": profile_branch,
-              "kernel_version": profile.get("kernel_version", ""),
-              "android_release": profile.get("android_release", ""),
-              "backend": profile.get("backend", ""),
-              "clang": profile.get("clang", ""),
-              "kernel_build_path": profile.get("kernel_build_path", ""),
-              "kernel_build_ref": profile.get("kernel_build_ref", ""),
-              "kleaf_workspace_path": profile.get("kleaf_workspace_path", ""),
-              "kernel_manifest_branch": profile.get("kernel_manifest_branch", ""),
-              "lto": profile.get("lto", ""),
+              "profile_branch": p.get("branch", ""),
+              "kernel_version": p.get("kernel_version", ""),
+              "android_release": p.get("android_release", ""),
+              "backend": p.get("backend", ""),
+              "clang": clang,
+              "kernel_build_path": p.get("kernel_build_path", ""),
+              "kernel_build_ref": p.get("kernel_build_ref", ""),
+              "lto": p.get("lto", ""),
           }
 
-          backend = fields["backend"]
-          if backend not in {"google_build_sh", "kleaf"}:
-              raise SystemExit(f"Unsupported backend in profile: {backend!r}")
-
-          clang = fields["clang"]
-          if not isinstance(clang, str) or not clang.startswith("clang-r"):
-              raise SystemExit(f"Invalid clang in profile: {clang!r}")
-
-          for key, value in fields.items():
-              if value is None:
-                  value = ""
-              print(f"{key}={value}")
+          for k, v in fields.items():
+              print(f"{k}={'' if v is None else v}")
           PY
+
+      - name: Checkout selected ACK cache
+        shell: bash
+        env:
+          KERNEL_BUILD_PATH: ${{ steps.profile.outputs.kernel_build_path }}
+        run: |
+          set -euo pipefail
+
+          git -C ack-control sparse-checkout set \
+            build.sh \
+            scripts \
+            configs \
+            "${KERNEL_BUILD_PATH}" \
+            external/prebuilts/build-tools
+
+          test -d "ack-control/${KERNEL_BUILD_PATH}" || {
+            echo "Missing ${KERNEL_BUILD_PATH}. Run setup-cache.yml first." >&2
+            exit 1
+          }
+
+          test -d "ack-control/external/prebuilts/build-tools" || {
+            echo "Missing external/prebuilts/build-tools. Run setup-cache.yml first." >&2
+            exit 1
+          }
+
+      - name: Install minimal host deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc \
+            bison \
+            flex \
+            libc6-dev \
+            libelf-dev \
+            rsync \
+            zstd
+          sudo rm -rf /var/lib/apt/lists/*
 
       - name: Checkout kernel source
         uses: actions/checkout@v4
@@ -183,6 +147,7 @@ jobs:
           submodules: false
 
       - name: Download Clang
+        id: clang
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -201,8 +166,9 @@ jobs:
             --dir toolchains
 
           archive="$(find toolchains -maxdepth 1 -type f -name "${pattern}" -print -quit)"
+
           test -n "${archive}" || {
-            echo "Could not find downloaded archive matching ${pattern}" >&2
+            echo "Missing Clang archive: ${pattern}" >&2
             exit 1
           }
 
@@ -210,27 +176,15 @@ jobs:
           tar --zstd -xf "${archive}" -C toolchains
           rm -f "${archive}"
 
-          test -x "toolchains/${CLANG}/bin/clang"
-
-      - name: Verify Clang
-        id: clang
-        shell: bash
-        env:
-          CLANG: ${{ steps.profile.outputs.clang }}
-        run: |
-          set -euo pipefail
-
-          CLANG_DIR="${GITHUB_WORKSPACE}/toolchains/${CLANG}"
-          test -x "${CLANG_DIR}/bin/clang"
-
-          sha256="$(awk '{print $1}' clang-archive.sha256)"
+          clang_dir="${GITHUB_WORKSPACE}/toolchains/${CLANG}"
+          test -x "${clang_dir}/bin/clang"
 
           {
-            echo "dir=${CLANG_DIR}"
-            echo "sha256=${sha256}"
+            echo "dir=${clang_dir}"
+            echo "sha256=$(awk '{print $1}' clang-archive.sha256)"
           } >> "${GITHUB_OUTPUT}"
 
-          echo "Using $("${CLANG_DIR}/bin/clang" --version | head -n 1)"
+          "${clang_dir}/bin/clang" --version | head -n 1
 
       - name: Add 16GB swap
         shell: bash
@@ -238,25 +192,14 @@ jobs:
           set -euo pipefail
 
           swapfile="/mnt/swapfile"
-
           sudo swapoff "${swapfile}" 2>/dev/null || true
           sudo rm -f "${swapfile}"
-
           sudo fallocate -l 16G "${swapfile}" || sudo dd if=/dev/zero of="${swapfile}" bs=1M count=16384 status=progress
           sudo chmod 600 "${swapfile}"
           sudo mkswap "${swapfile}"
           sudo swapon "${swapfile}"
-          echo "Enabled 16G swap at ${swapfile}"
 
-      - name: Install BTF dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libc6-dev libelf-dev
-          sudo rm -rf /var/lib/apt/lists/*
-
-      - name: Run ACK build wrapper
+      - name: Build kernel
         shell: bash
         env:
           ACK_BRANCH: ${{ matrix.ack_branch }}
@@ -280,16 +223,11 @@ jobs:
           BACKEND: ${{ steps.profile.outputs.backend }}
           KERNEL_BUILD_PATH: ${{ steps.profile.outputs.kernel_build_path }}
           KERNEL_BUILD_REF: ${{ steps.profile.outputs.kernel_build_ref }}
-          KLEAF_WORKSPACE_PATH: ${{ steps.profile.outputs.kleaf_workspace_path }}
-          KERNEL_MANIFEST_BRANCH: ${{ steps.profile.outputs.kernel_manifest_branch }}
           CLANG: ${{ steps.profile.outputs.clang }}
           CLANG_ARCHIVE_SHA256: ${{ steps.clang.outputs.sha256 }}
           LTO: ${{ steps.profile.outputs.lto }}
         run: |
           set -euo pipefail
-
-          kernel_source_commit="$(git -C kernel/common rev-parse HEAD)"
-          date_utc="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 
           {
             echo "ack_branch=${ACK_BRANCH}"
@@ -299,13 +237,11 @@ jobs:
             echo "backend=${BACKEND}"
             echo "kernel_build_path=${KERNEL_BUILD_PATH}"
             echo "kernel_build_ref=${KERNEL_BUILD_REF}"
-            echo "kleaf_workspace_path=${KLEAF_WORKSPACE_PATH}"
-            echo "kernel_manifest_branch=${KERNEL_MANIFEST_BRANCH}"
-            echo "kernel_source_commit=${kernel_source_commit}"
+            echo "kernel_source_commit=$(git -C kernel/common rev-parse HEAD)"
             echo "clang=${CLANG}"
             echo "clang_archive_sha256=${CLANG_ARCHIVE_SHA256}"
             echo "lto=${LTO}"
-            echo "date_utc=${date_utc}"
+            echo "date_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           } > build-info.txt
 
       - name: Stage artifacts
@@ -316,11 +252,7 @@ jobs:
           set -euo pipefail
 
           work_root="ack-control/.work/${ACK_BRANCH}"
-
-          test -d "${work_root}" || {
-            echo "Expected ACK worktree missing: ${work_root}" >&2
-            exit 1
-          }
+          test -d "${work_root}"
 
           rm -rf dist
           mkdir -p dist/images dist/config dist/debug dist/logs dist/metadata
@@ -342,46 +274,33 @@ jobs:
           find "${work_root}" -type f -name '*.log' \
             -exec cp -a {} dist/logs/ \; || true
 
-          image_count="$(find dist/images -type f | wc -l)"
-          if [ "${image_count}" -eq 0 ]; then
-            echo "No kernel image artifact found under ${work_root}" >&2
+          test "$(find dist/images -type f | wc -l)" -gt 0 || {
+            echo "No kernel image found" >&2
             exit 1
-          fi
+          }
 
           ikconfig_extracted=no
           extract_script="kernel/common/scripts/extract-ikconfig"
           ikconfig_output="dist/config/ikconfig-extracted.config"
           ikconfig_tmp="${ikconfig_output}.tmp"
+
           rm -f "${ikconfig_output}" "${ikconfig_tmp}"
 
           if [ -f "${extract_script}" ]; then
-            candidates=(
-              "${work_root}/dist/Image"
-              "${work_root}/dist/Image.gz"
-              "${work_root}/dist/Image.lz4"
-              "${work_root}/out/arch/arm64/boot/Image"
-              "${work_root}/out/arch/arm64/boot/Image.gz"
-              "${work_root}/out/arch/arm64/boot/Image.lz4"
-            )
-
-            for candidate in "${candidates[@]}"; do
-              [ -f "${candidate}" ] || continue
-              if bash "${extract_script}" "${candidate}" > "${ikconfig_tmp}" 2>/dev/null && [ -s "${ikconfig_tmp}" ]; then
+            while IFS= read -r image; do
+              if bash "${extract_script}" "${image}" > "${ikconfig_tmp}" 2>/dev/null && [ -s "${ikconfig_tmp}" ]; then
                 mv "${ikconfig_tmp}" "${ikconfig_output}"
                 ikconfig_extracted=yes
-                echo "Extracted IKCONFIG from ${candidate}"
                 break
               fi
               rm -f "${ikconfig_tmp}"
-            done
+            done < <(find dist/images -type f | sort)
           fi
 
           echo "ikconfig_extracted=${ikconfig_extracted}" >> build-info.txt
           install -D -m 0644 build-info.txt dist/metadata/build-info.txt
 
-          echo "Staged $(find dist -type f | wc -l) artifact files for ${ACK_BRANCH}."
-
-      - name: Print failure diagnostics
+      - name: Print failure logs
         if: failure()
         shell: bash
         env:
@@ -391,40 +310,15 @@ jobs:
 
           work_root="ack-control/.work/${ACK_BRANCH}"
 
-          echo "Failure diagnostics for ${ACK_BRANCH}:"
-          if [ -f build-info.txt ]; then
-            cat build-info.txt
-          fi
+          [ -f build-info.txt ] && cat build-info.txt || true
 
-          if [ -d "${work_root}" ]; then
-            echo
-            echo "Relevant files under ${work_root}:"
-            find "${work_root}" -maxdepth 2 -type f \( \
-              -name '*.log' -o \
-              -name 'Image' -o \
-              -name 'Image.gz' -o \
-              -name 'Image.lz4' -o \
-              -name '.config' -o \
-              -name 'System.map' -o \
-              -name 'vmlinux' -o \
-              -name 'MODULE.bazel' -o \
-              -name 'WORKSPACE' -o \
-              -name 'WORKSPACE.bazel' -o \
-              -name 'WORKSPACE.bzlmod' -o \
-              -name '.bazelrc' -o \
-              -name 'bazel' -o \
-              -name 'bazel.sh' -o \
-              -name '_setup_env.sh' \
-            \) -printf '%P\n' | sort
-
+          if [ -d "${work_root}/logs" ]; then
             for log in "${work_root}"/logs/*.log; do
               [ -f "${log}" ] || continue
               echo
-              echo "Last 40 lines of ${log##${work_root}/}:"
-              tail -n 40 "${log}"
+              echo "Last 80 lines of ${log##${work_root}/}:"
+              tail -n 80 "${log}"
             done
-          else
-            echo "Missing worktree: ${work_root}" >&2
           fi
 
       - name: Upload artifact
